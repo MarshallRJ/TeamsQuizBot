@@ -21,6 +21,7 @@ async function buildResults(store, sessionId) {
     const breakdown = run.answers.map((a) => {
       const q = questionsById.get(a.questionId);
       return {
+        questionId: a.questionId,
         questionText: q ? q.text : '(unknown)',
         given: a.given,
         givenText: a.given && q ? q.options[a.given] : null,
@@ -53,6 +54,46 @@ async function buildResults(store, sessionId) {
   };
 }
 
+/**
+ * Aggregate a results report into session-level stats: participation, average
+ * score, and per-question difficulty (correct rate, hardest first). Error runs
+ * (participant unreachable) are excluded from score/question averages.
+ */
+function summarize(report) {
+  const all = report.participants;
+  const scored = all.filter((p) => p.status !== 'error');
+  const totalScore = scored.reduce((s, p) => s + p.score, 0);
+  const totalPossible = scored.reduce((s, p) => s + p.total, 0);
+
+  const qmap = new Map();
+  for (const p of scored) {
+    for (const b of p.breakdown) {
+      if (!b.questionId) continue;
+      const e = qmap.get(b.questionId) || {
+        questionId: b.questionId,
+        questionText: b.questionText,
+        asked: 0,
+        correct: 0,
+      };
+      e.asked += 1;
+      if (b.correct) e.correct += 1;
+      qmap.set(b.questionId, e);
+    }
+  }
+  const questionStats = [...qmap.values()]
+    .map((e) => ({ ...e, correctRate: e.asked ? Math.round((100 * e.correct) / e.asked) : 0 }))
+    .sort((a, b) => a.correctRate - b.correctRate);
+
+  return {
+    participantCount: all.length,
+    completed: all.filter((p) => p.status === 'completed').length,
+    errored: all.filter((p) => p.status === 'error').length,
+    averageScore: scored.length ? Math.round((100 * totalScore) / scored.length) / 100 : 0,
+    averagePercent: totalPossible ? Math.round((100 * totalScore) / totalPossible) : 0,
+    questionStats,
+  };
+}
+
 function csvEscape(value) {
   const s = value === null || value === undefined ? '' : String(value);
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
@@ -72,4 +113,4 @@ function resultsToCsv(report) {
   return lines.join('\n') + '\n';
 }
 
-module.exports = { buildResults, resultsToCsv };
+module.exports = { buildResults, summarize, resultsToCsv };

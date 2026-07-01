@@ -3,6 +3,7 @@
 const { pickN } = require('./randomizer');
 const { normalizeAnswer } = require('./answerParser');
 const { scoreRun } = require('./scoring');
+const { buildResults, summarize } = require('./results');
 
 function formatQuestion(q, index, total) {
   return (
@@ -100,6 +101,11 @@ function createEngine({ store, graphClient, questionTimeoutMs = 300000, logger =
     if (!quiz) throw new Error(`Quiz ${quizId} not found.`);
     if (!quiz.questionIds.length) throw new Error('Quiz has no questions uploaded.');
 
+    const existing = await store.listSessions(quizId);
+    if (existing.some((s) => s.status === 'running')) {
+      throw new Error('A session is already running for this quiz. Abandon it before starting a new one.');
+    }
+
     const participants = await store.listParticipants(quizId);
     if (!participants.length) throw new Error('Quiz has no participants uploaded.');
 
@@ -137,6 +143,37 @@ function createEngine({ store, graphClient, questionTimeoutMs = 300000, logger =
       await store.updateRun(run);
     }
 
+    return session;
+  }
+
+  /**
+   * Freeze a finished session's results into a durable snapshot and store a
+   * compact summary on the session record (used for history listings). The
+   * snapshot embeds question text, so results survive later question re-uploads.
+   */
+  async function finalizeSession(session, now) {
+    session.finalizedAt = nowIso(now);
+    await store.updateSession(session); // persist final status first
+    const report = await buildResults(store, session.id);
+    session.summary = summarize(report);
+    await store.saveSnapshot(session.id, report);
+    await store.updateSession(session); // persist the summary
+  }
+
+  /**
+   * Abandon a running session so a fresh one can be started for the quiz. Its
+   * runs are left as-is but stop being processed (tick only touches running
+   * sessions), and their partial answers remain viewable in the results report.
+   */
+  async function abandonSession(sessionId, now = Date.now()) {
+    const session = await store.getSession(sessionId);
+    if (!session) throw new Error(`Session ${sessionId} not found.`);
+    if (session.status !== 'running') {
+      throw new Error(`Session cannot be abandoned (status: ${session.status}).`);
+    }
+    session.status = 'abandoned';
+    session.abandonedAt = nowIso(now);
+    await finalizeSession(session, now);
     return session;
   }
 
@@ -195,12 +232,12 @@ function createEngine({ store, graphClient, questionTimeoutMs = 300000, logger =
     if (!active) {
       session.status = 'completed';
       session.completedAt = nowIso(now);
-      await store.updateSession(session);
+      await finalizeSession(session, now);
     }
     return { quiz, runs };
   }
 
-  return { startSession, tick, tickSession, tickRun, scoreRun, formatQuestion };
+  return { startSession, abandonSession, tick, tickSession, tickRun, scoreRun, formatQuestion };
 }
 
 module.exports = { createEngine, formatQuestion, formatWelcome, escapeHtml };

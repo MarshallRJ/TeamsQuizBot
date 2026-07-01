@@ -46,6 +46,7 @@ function createStore(db) {
   const participants = db.sublevel('participants', { valueEncoding: 'json' });
   const sessions = db.sublevel('sessions', { valueEncoding: 'json' });
   const runs = db.sublevel('runs', { valueEncoding: 'json' });
+  const snapshots = db.sublevel('snapshots', { valueEncoding: 'json' });
 
   return {
     db,
@@ -155,6 +156,7 @@ function createStore(db) {
         status: 'running',
         startedAt: new Date().toISOString(),
         completedAt: null,
+        abandonedAt: null,
       };
       await sessions.put(session.id, session);
       return session;
@@ -195,6 +197,16 @@ function createStore(db) {
     async updateRun(run) {
       await runs.put(`${run.sessionId}:${run.id}`, run);
       return run;
+    },
+
+    // ---- Results snapshots (frozen when a session ends) ----
+    async saveSnapshot(sessionId, report) {
+      await snapshots.put(sessionId, report);
+      return report;
+    },
+
+    getSnapshot(sessionId) {
+      return getOrNull(snapshots, sessionId);
     },
   };
 }

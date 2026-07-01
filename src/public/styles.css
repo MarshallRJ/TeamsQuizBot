@@ -76,6 +76,9 @@ button, .primary {
 }
 button:hover { filter: brightness(1.05); }
 button.secondary { background: #e5e7eb; color: var(--ink); }
+button.danger { background: #fee2e2; color: var(--err); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+.session-actions { display: flex; gap: 0.5rem; }
 
 .hint { font-size: 0.8rem; color: var(--muted); margin: 0.2rem 0 0.5rem; }
 .status { font-size: 0.85rem; margin-left: 0.5rem; }
@@ -102,6 +105,13 @@ th { color: var(--muted); font-weight: 600; }
 .badge.running { background: #fef9c3; color: #854d0e; }
 .badge.completed { background: #dcfce7; color: var(--ok); }
 .badge.error { background: #fee2e2; color: var(--err); }
+.badge.abandoned { background: #e5e7eb; color: var(--muted); }
 
 .results-actions { display: flex; gap: 1rem; align-items: center; margin-bottom: 1rem; }
+.summary { display: flex; gap: 1.25rem; align-items: center; flex-wrap: wrap; margin-bottom: 1rem; }
+.summary .stat { font-size: 0.9rem; color: var(--muted); }
+.summary .stat strong { color: var(--ink); font-size: 1.05rem; }
+.summary .stat.err { color: var(--err); }
+ul.hardest { font-size: 0.88rem; color: var(--ink); padding-left: 1.1rem; }
+ul.hardest li { margin: 0.25rem 0; }
 a { color: var(--accent); }

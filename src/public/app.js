@@ -104,6 +104,18 @@ $('#start-session').onclick = async () => {
 
 function renderSessions(sessions) {
   const box = $('#sessions');
+
+  // Only one running session is allowed per quiz.
+  const running = sessions.find((s) => s.status === 'running');
+  $('#start-session').disabled = Boolean(running);
+  const startStatus = $('#start-status');
+  if (running && !startStatus.textContent) {
+    startStatus.textContent = 'A session is already running — abandon it to start a new one.';
+    startStatus.className = 'status';
+  } else if (!running && startStatus.className === 'status') {
+    startStatus.textContent = ''; // clear the neutral note, keep ok/err messages
+  }
+
   if (!sessions.length) {
     box.innerHTML = '<p class="meta">No sessions run yet.</p>';
     return;
@@ -112,14 +124,35 @@ function renderSessions(sessions) {
   for (const s of sessions) {
     const div = document.createElement('div');
     div.className = 'session-item';
+    const abandonBtn =
+      s.status === 'running' ? '<button class="danger" data-abandon>Abandon</button>' : '';
+    const summary = s.summary
+      ? `<span class="meta"> · ${s.summary.averagePercent}% avg · ${s.summary.participantCount} participant(s)</span>`
+      : '';
     div.innerHTML = `
       <div>
         <span class="badge ${s.status}">${s.status}</span>
         <span class="meta">started ${new Date(s.startedAt).toLocaleString()}</span>
+        ${summary}
       </div>
-      <button class="secondary">View results</button>`;
-    div.querySelector('button').onclick = () => openResults(s.id);
+      <div class="session-actions">
+        ${abandonBtn}
+        <button class="secondary" data-results>View results</button>
+      </div>`;
+    div.querySelector('[data-results]').onclick = () => openResults(s.id);
+    const ab = div.querySelector('[data-abandon]');
+    if (ab) ab.onclick = () => abandonSession(s.id);
     box.appendChild(div);
+  }
+}
+
+async function abandonSession(sessionId) {
+  if (!confirm('Abandon this running session? Participants stop receiving questions and you can start a new one.')) return;
+  try {
+    await api(`/sessions/${sessionId}/abandon`, { method: 'POST' });
+    await openQuiz(currentQuizId);
+  } catch (err) {
+    setStatus($('#start-status'), err.message, false);
   }
 }
 
@@ -137,6 +170,7 @@ $('#refresh-results').onclick = loadResults;
 async function loadResults() {
   if (!currentSessionId) return;
   const report = await api(`/sessions/${currentSessionId}/results`);
+  const s = report.summary || {};
   const rows = report.participants
     .map(
       (p) => `<tr>
@@ -148,12 +182,28 @@ async function loadResults() {
       </tr>`
     )
     .join('');
+
+  // Hardest questions (lowest correct rate) — up to 5.
+  const hardest = (s.questionStats || [])
+    .slice(0, 5)
+    .map(
+      (q) => `<li>${escapeHtml(q.questionText)} — <strong>${q.correctRate}%</strong> correct (${q.correct}/${q.asked})</li>`
+    )
+    .join('');
+
   $('#results-body').innerHTML = `
-    <p class="meta">Session ${report.session.status} · ${report.participants.length} participant(s)</p>
+    <div class="summary">
+      <span class="badge ${report.session.status}">${report.session.status}</span>
+      <span class="stat"><strong>${s.averagePercent ?? 0}%</strong> avg score</span>
+      <span class="stat"><strong>${s.averageScore ?? 0}</strong> avg correct</span>
+      <span class="stat"><strong>${s.completed ?? 0}</strong>/${s.participantCount ?? 0} completed</span>
+      ${s.errored ? `<span class="stat err">${s.errored} unreachable</span>` : ''}
+    </div>
     <table>
       <thead><tr><th>Name</th><th>Email</th><th>Status</th><th>Score</th><th>Detail</th></tr></thead>
       <tbody>${rows || '<tr><td colspan="5" class="meta">No data yet.</td></tr>'}</tbody>
-    </table>`;
+    </table>
+    ${hardest ? `<h3>Hardest questions</h3><ul class="hardest">${hardest}</ul>` : ''}`;
 }
 
 function escapeHtml(s) {

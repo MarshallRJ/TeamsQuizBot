@@ -181,6 +181,87 @@ describe('engine end-to-end (Graph mocked)', () => {
     expect(alice.status).toBe('completed');
   });
 
+  test('only one running session is allowed per quiz', async () => {
+    const { engine, quiz } = await setup();
+    await engine.startSession(quiz.id, T0);
+    await expect(engine.startSession(quiz.id, T0 + 1000)).rejects.toThrow(/already running/i);
+  });
+
+  test('an abandoned session can be replaced by a new one, and is no longer ticked', async () => {
+    const { store, engine, quiz } = await setup();
+    const first = await engine.startSession(quiz.id, T0);
+
+    const abandoned = await engine.abandonSession(first.id, T0 + 500);
+    expect(abandoned.status).toBe('abandoned');
+    expect(abandoned.abandonedAt).toBeTruthy();
+
+    // tick must not resurrect or complete an abandoned session
+    await engine.tick(T0 + 10 * TIMEOUT);
+    expect((await store.getSession(first.id)).status).toBe('abandoned');
+
+    // a new session can now be started
+    const second = await engine.startSession(quiz.id, T0 + 1000);
+    expect(second.id).not.toBe(first.id);
+    expect(second.status).toBe('running');
+  });
+
+  test('abandoning a non-running session throws', async () => {
+    const { store, engine, quiz } = await setup();
+    const session = await engine.startSession(quiz.id, T0);
+    await engine.abandonSession(session.id, T0 + 500);
+    await expect(engine.abandonSession(session.id, T0 + 600)).rejects.toThrow(/cannot be abandoned/i);
+  });
+
+  test('a completed session stores a durable snapshot + summary that survives question re-upload', async () => {
+    const { store, graph, engine, quiz } = await setup();
+    const session = await engine.startSession(quiz.id, T0);
+    let t = T0;
+
+    // Answer all 3 correctly so the run completes.
+    for (let i = 0; i < 3; i++) {
+      const run = await theRun(store, session.id);
+      const letter = await correctLetterFor(store, quiz.id, run);
+      graph.enqueue(run.chatId, letter, t + 500);
+      t += 1000;
+      await engine.tick(t);
+    }
+
+    const finished = await store.getSession(session.id);
+    expect(finished.status).toBe('completed');
+    expect(finished.summary).toMatchObject({ participantCount: 1, completed: 1, averagePercent: 100 });
+
+    const snap = await store.getSnapshot(session.id);
+    expect(snap).toBeTruthy();
+    expect(snap.participants[0].score).toBe(3);
+    expect(snap.participants[0].breakdown[0].questionText).toBeTruthy();
+
+    // Re-upload (replace) the quiz's questions — old question records are deleted.
+    await store.setQuestions(quiz.id, [
+      { text: 'brand new', options: { A: '1', B: '2', C: '3', D: '4' }, correct: 'A' },
+    ]);
+
+    // Snapshot still resolves the original question text (durability).
+    const stillThere = await store.getSnapshot(session.id);
+    expect(stillThere.participants[0].breakdown[0].questionText).not.toBe('(unknown)');
+    expect(stillThere.participants[0].score).toBe(3);
+  });
+
+  test('abandoning a session also freezes a snapshot with partial results', async () => {
+    const { store, graph, engine, quiz } = await setup();
+    const session = await engine.startSession(quiz.id, T0);
+
+    // Answer only the first question, then abandon.
+    let run = await theRun(store, session.id);
+    graph.enqueue(run.chatId, await correctLetterFor(store, quiz.id, run), T0 + 500);
+    await engine.tick(T0 + 1000);
+
+    await engine.abandonSession(session.id, T0 + 2000);
+    const snap = await store.getSnapshot(session.id);
+    expect(snap).toBeTruthy();
+    expect(snap.session.status).toBe('abandoned');
+    expect(snap.participants[0].score).toBe(1);
+  });
+
   test('a participant that cannot be reached is marked as an error run', async () => {
     const { store, engine, quiz } = await setup();
     const graphMissing = {

@@ -5,7 +5,7 @@ const multer = require('multer');
 
 const { parseQuestions } = require('../../quiz/questionParser');
 const { parseParticipants } = require('../../quiz/participantParser');
-const { buildResults, resultsToCsv } = require('../../quiz/results');
+const { buildResults, summarize, resultsToCsv } = require('../../quiz/results');
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
 
@@ -100,6 +100,14 @@ function createApiRouter({ store, engine }) {
     })
   );
 
+  router.post(
+    '/sessions/:id/abandon',
+    wrap(async (req, res) => {
+      const session = await engine.abandonSession(req.params.id);
+      res.json(session);
+    })
+  );
+
   router.get(
     '/sessions/:id',
     wrap(async (req, res) => {
@@ -121,14 +129,17 @@ function createApiRouter({ store, engine }) {
   router.get(
     '/sessions/:id/results',
     wrap(async (req, res) => {
-      res.json(await buildResults(store, req.params.id));
+      // A finished session serves its frozen snapshot; a running one is computed live.
+      const report = (await store.getSnapshot(req.params.id)) || (await buildResults(store, req.params.id));
+      report.summary = summarize(report);
+      res.json(report);
     })
   );
 
   router.get(
     '/sessions/:id/results.csv',
     wrap(async (req, res) => {
-      const report = await buildResults(store, req.params.id);
+      const report = (await store.getSnapshot(req.params.id)) || (await buildResults(store, req.params.id));
       res.setHeader('Content-Type', 'text/csv');
       res.setHeader('Content-Disposition', `attachment; filename="results-${req.params.id}.csv"`);
       res.send(resultsToCsv(report));
