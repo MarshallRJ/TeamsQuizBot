@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TeamsQuizBot — Admin</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>🎯 TeamsQuizBot</h1>
+      <p class="sub">Run multiple-choice quizzes over Microsoft Teams</p>
+    </header>
+
+    <main>
+      <section class="card">
+        <h2>Create a quiz</h2>
+        <form id="create-quiz-form">
+          <div class="row">
+            <input id="quiz-title" type="text" placeholder="Quiz title" required />
+            <label>Questions per participant
+              <input id="quiz-n" type="number" min="1" value="5" required />
+            </label>
+          </div>
+          <label class="full">Description (shown to participants when the quiz starts)
+            <textarea id="quiz-description" rows="2" placeholder="e.g. A short quiz on our Work Item Lifecycle SOP." required></textarea>
+          </label>
+          <button type="submit">Create</button>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2>Quizzes</h2>
+        <div id="quizzes"></div>
+      </section>
+
+      <section id="detail" class="card hidden">
+        <h2>Quiz: <span id="detail-title"></span></h2>
+        <div class="grid">
+          <div>
+            <h3>1. Upload questions (CSV)</h3>
+            <p class="hint">Columns: <code>text,A,B,C,D,correct</code></p>
+            <input type="file" id="questions-file" accept=".csv" />
+            <button id="upload-questions">Upload</button>
+            <span id="questions-status" class="status"></span>
+          </div>
+          <div>
+            <h3>2. Upload participants (CSV)</h3>
+            <p class="hint">Column: <code>email</code> (optional <code>name</code>)</p>
+            <input type="file" id="participants-file" accept=".csv" />
+            <button id="upload-participants">Upload</button>
+            <span id="participants-status" class="status"></span>
+          </div>
+        </div>
+        <div class="start-row">
+          <button id="start-session" class="primary">3. Start quiz session</button>
+          <span id="start-status" class="status"></span>
+        </div>
+        <h3>Sessions</h3>
+        <div id="sessions"></div>
+      </section>
+
+      <section id="results" class="card hidden">
+        <h2>Results</h2>
+        <div class="results-actions">
+          <button id="refresh-results">Refresh</button>
+          <a id="download-csv" href="#">Download CSV</a>
+        </div>
+        <div id="results-body"></div>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

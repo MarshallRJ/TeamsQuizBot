@@ -1,0 +1,32 @@
+{
+  "name": "teams-quiz-bot",
+  "version": "1.0.0",
+  "description": "Run multiple-choice quizzes over Microsoft Teams (1:1 chat via Graph), store results locally in LevelDB, manage via an admin web UI.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "jest"
+  },
+  "keywords": [
+    "teams",
+    "quiz",
+    "microsoft-graph",
+    "leveldb"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@azure/msal-node": "^2.16.2",
+    "classic-level": "^1.4.1",
+    "csv-parse": "^5.5.6",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "multer": "^1.4.5-lts.1"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "memory-level": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
