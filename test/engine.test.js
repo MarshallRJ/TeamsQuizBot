@@ -5,30 +5,51 @@ const { createStore } = require('../src/db/store');
 const { createEngine } = require('../src/quiz/engine');
 const { buildResults } = require('../src/quiz/results');
 
-/** A fake Graph client: records outgoing messages, serves scripted replies. */
+/**
+ * A fake Graph client that models real Teams behaviour: every message carries a
+ * server-assigned createdDateTime from a clock that is INDEPENDENT of the
+ * engine's local `now` (here it lives in 2030, while tests drive `now` in 2026).
+ * This is what a single-clock fake hid: the engine must not use its local clock
+ * to decide which replies are new.
+ */
 function makeFakeGraph() {
   const sent = []; // { chatId, html }
-  const inbox = {}; // chatId -> [{ createdDateTime, text }]
+  const chats = {}; // chatId -> [{ id, createdDateTime, text, bot }]
+  let seq = 0;
+  const SERVER_BASE = Date.parse('2030-01-01T00:00:00.000Z');
+  const nextTs = () => new Date(SERVER_BASE + ++seq * 1000).toISOString();
+  const log = (chatId) => (chats[chatId] = chats[chatId] || []);
+  const addParticipantMsg = (chatId, text) =>
+    log(chatId).push({ id: 'p' + seq, createdDateTime: nextTs(), text, bot: false });
+
   return {
     sent,
     lastHtml: () => sent[sent.length - 1] && sent[sent.length - 1].html,
-    enqueue(chatId, text, whenMs) {
-      (inbox[chatId] = inbox[chatId] || []).push({
-        createdDateTime: new Date(whenMs).toISOString(),
-        text,
-      });
+    countSentTo: (chatId) => sent.filter((m) => m.chatId === chatId).length,
+    // A participant reply arriving "now" on the server clock. (Extra args ignored
+    // for back-compat with older call sites that passed a local timestamp.)
+    enqueue(chatId, text) {
+      addParticipantMsg(chatId, text);
+    },
+    // A message already present in the chat before the quiz starts, e.g. a reply
+    // left over from a previous session in the same persistent 1:1 chat.
+    seed(chatId, text) {
+      addParticipantMsg(chatId, text);
     },
     async ensureOneOnOneChat(email) {
       return 'chat-' + email;
     },
     async sendMessage(chatId, html) {
+      const createdDateTime = nextTs();
+      const id = 'm' + seq;
+      log(chatId).push({ id, createdDateTime, html, bot: true });
       sent.push({ chatId, html });
-      return 'm' + sent.length;
+      return { id, createdDateTime };
     },
     async getMessagesSince(chatId, since) {
-      return (inbox[chatId] || [])
-        .filter((m) => !since || m.createdDateTime > since)
-        .map((m, i) => ({ id: 'in' + i, createdDateTime: m.createdDateTime, fromUserId: 'u', text: m.text }))
+      return log(chatId)
+        .filter((m) => !m.bot && (!since || m.createdDateTime > since))
+        .map((m) => ({ id: m.id, createdDateTime: m.createdDateTime, fromUserId: 'u', text: m.text }))
         .sort((a, b) => a.createdDateTime.localeCompare(b.createdDateTime));
     },
   };
@@ -60,10 +81,34 @@ async function setup() {
   return { store, graph, engine, quiz };
 }
 
+/** Build a session with several participants. */
+async function setupMulti(emails) {
+  const store = createStore(new MemoryLevel());
+  const graph = makeFakeGraph();
+  const engine = createEngine({ store, graphClient: graph, questionTimeoutMs: TIMEOUT });
+  const quiz = await store.createQuiz({
+    title: 'Test',
+    description: 'A short test quiz.',
+    questionsPerParticipant: 3,
+  });
+  await store.setQuestions(quiz.id, QUESTIONS);
+  await store.setParticipants(
+    quiz.id,
+    emails.map((e) => ({ email: e, name: e }))
+  );
+  return { store, graph, engine, quiz };
+}
+
 /** Reload the single run for a session. */
 async function theRun(store, sessionId) {
   const runs = await store.listRuns(sessionId);
   return runs[0];
+}
+
+/** Reload a specific participant's run by email. */
+async function runFor(store, sessionId, email) {
+  const runs = await store.listRuns(sessionId);
+  return runs.find((r) => r.participantEmail === email);
 }
 
 /** Correct letter for the run's current question. */
@@ -289,5 +334,73 @@ describe('engine end-to-end (Graph mocked)', () => {
     // session should complete immediately since no runs are active
     await eng.tick(T0 + 1000);
     expect((await store.getSession(session.id)).status).toBe('completed');
+  });
+});
+
+describe('multi-participant ordering (regression)', () => {
+  test('one participant answering does not advance the others', async () => {
+    const emails = ['a@example.com', 'b@example.com', 'c@example.com'];
+    const { store, graph, engine, quiz } = await setupMulti(emails);
+    const session = await engine.startSession(quiz.id, T0);
+
+    // Each participant got exactly a welcome + question 1 (2 messages).
+    for (const e of emails) expect(graph.countSentTo('chat-' + e)).toBe(2);
+
+    // Only A answers.
+    const a = await runFor(store, session.id, 'a@example.com');
+    graph.enqueue(a.chatId, await correctLetterFor(store, quiz.id, a));
+    await engine.tick(T0 + 1000);
+
+    // A advanced to Q2; B and C are untouched — still on Q1, no extra messages.
+    expect((await runFor(store, session.id, 'a@example.com')).currentIndex).toBe(1);
+    expect(graph.countSentTo('chat-a@example.com')).toBe(3); // welcome + Q1 + Q2
+
+    for (const e of ['b@example.com', 'c@example.com']) {
+      const r = await runFor(store, session.id, e);
+      expect(r.currentIndex).toBe(0);
+      expect(r.answers).toHaveLength(0);
+      expect(graph.countSentTo('chat-' + e)).toBe(2); // no next question sent
+    }
+  });
+
+  test('a reply to one question is never reused as the answer to the next', async () => {
+    // This is the core bug: with a local-clock watermark, the Q1 reply (server
+    // clock, "in the future") read as newer than Q2's watermark and auto-answered
+    // Q2 — sending Q3 before the participant ever answered Q2.
+    const { store, graph, engine, quiz } = await setupMulti(['a@example.com']);
+    const session = await engine.startSession(quiz.id, T0);
+
+    let run = await runFor(store, session.id, 'a@example.com');
+    graph.enqueue(run.chatId, await correctLetterFor(store, quiz.id, run)); // answer Q1
+    await engine.tick(T0 + 1000);
+
+    run = await runFor(store, session.id, 'a@example.com');
+    expect(run.currentIndex).toBe(1); // advanced to Q2 exactly once
+    expect(run.answers).toHaveLength(1);
+
+    // No new reply for Q2. Several ticks must NOT advance past Q2.
+    await engine.tick(T0 + 2000);
+    await engine.tick(T0 + 3000);
+    run = await runFor(store, session.id, 'a@example.com');
+    expect(run.currentIndex).toBe(1);
+    expect(run.answers).toHaveLength(1);
+    expect(graph.countSentTo('chat-a@example.com')).toBe(3); // welcome + Q1 + Q2 only
+  });
+
+  test('pre-existing chat history (from a previous session) is ignored', async () => {
+    const { store, graph, engine, quiz } = await setupMulti(['a@example.com']);
+
+    // Leftover replies sitting in the persistent 1:1 chat before this quiz.
+    graph.seed('chat-a@example.com', 'A');
+    graph.seed('chat-a@example.com', 'B');
+
+    const session = await engine.startSession(quiz.id, T0);
+    await engine.tick(T0 + 1000);
+
+    // The stale letters must not be consumed as answers to Q1.
+    const run = await runFor(store, session.id, 'a@example.com');
+    expect(run.currentIndex).toBe(0);
+    expect(run.answers).toHaveLength(0);
+    expect(run.status).toBe('awaiting');
   });
 });
