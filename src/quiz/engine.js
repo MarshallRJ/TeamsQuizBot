@@ -63,8 +63,12 @@ function createEngine({ store, graphClient, questionTimeoutMs = 300000, logger =
   async function sendCurrentQuestion(run, questionsById, now) {
     const total = run.questionOrder.length;
     const q = questionsById.get(run.questionOrder[run.currentIndex]);
-    await graphClient.sendMessage(run.chatId, formatQuestion(q, run.currentIndex, total));
-    run.currentSentAt = nowIso(now);
+    const sent = await graphClient.sendMessage(run.chatId, formatQuestion(q, run.currentIndex, total));
+    // Watermark replies against Graph's clock: only messages newer than this
+    // just-sent question count as answers to it. This ignores any pre-existing
+    // chat history (e.g. replies from a previous session in the same 1:1 chat).
+    if (sent && sent.createdDateTime) run.seenUpTo = sent.createdDateTime;
+    run.currentSentAt = nowIso(now); // local clock, used only for the timeout
     run.reprompted = false;
     run.status = 'awaiting';
   }
@@ -126,6 +130,7 @@ function createEngine({ store, graphClient, questionTimeoutMs = 300000, logger =
         currentIndex: 0,
         status: 'pending',
         currentSentAt: null,
+        seenUpTo: null,
         reprompted: false,
         answers: [],
         error: null,
@@ -181,7 +186,16 @@ function createEngine({ store, graphClient, questionTimeoutMs = 300000, logger =
   async function tickRun(run, questionsById, now) {
     if (run.status !== 'awaiting') return;
 
-    const messages = await graphClient.getMessagesSince(run.chatId, run.currentSentAt);
+    const messages = await graphClient.getMessagesSince(run.chatId, run.seenUpTo);
+    // Advance the watermark past everything we just read so no message is ever
+    // considered twice — even if we don't act on it this tick.
+    if (messages.length) {
+      run.seenUpTo = messages.reduce(
+        (max, m) => (m.createdDateTime > max ? m.createdDateTime : max),
+        run.seenUpTo || ''
+      );
+    }
+
     const validMsg = messages
       .map((m) => normalizeAnswer(m.text))
       .find((letter) => letter !== null);

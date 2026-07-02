@@ -81,12 +81,16 @@ function createGraphClient({ tokenProvider, fetchImpl = fetch, baseUrl = DEFAULT
       return chat.id;
     },
 
-    /** Send an HTML message to a chat. Returns the created message's id. */
+    /**
+     * Send an HTML message to a chat. Returns the created message's id and
+     * server-assigned createdDateTime — the latter is used as a reply watermark
+     * so we compare against Graph's own clock, never the bot's local clock.
+     */
     async sendMessage(chatId, html) {
       const msg = await request('POST', `/chats/${chatId}/messages`, {
         body: { contentType: 'html', content: html },
       });
-      return msg.id;
+      return { id: msg.id, createdDateTime: msg.createdDateTime };
     },
 
     /**
