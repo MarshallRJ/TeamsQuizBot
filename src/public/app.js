@@ -179,6 +179,7 @@ async function loadResults() {
         <td><span class="badge ${p.status}">${p.status}</span></td>
         <td>${p.score} / ${p.total}</td>
         <td>${p.answered} answered, ${p.unanswered} skipped</td>
+        <td><button class="secondary" data-chat="${p.participantId}" data-name="${escapeHtml(p.name || p.email)}">Chat</button></td>
       </tr>`
     )
     .join('');
@@ -200,11 +201,44 @@ async function loadResults() {
       ${s.errored ? `<span class="stat err">${s.errored} unreachable</span>` : ''}
     </div>
     <table>
-      <thead><tr><th>Name</th><th>Email</th><th>Status</th><th>Score</th><th>Detail</th></tr></thead>
-      <tbody>${rows || '<tr><td colspan="5" class="meta">No data yet.</td></tr>'}</tbody>
+      <thead><tr><th>Name</th><th>Email</th><th>Status</th><th>Score</th><th>Detail</th><th></th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="6" class="meta">No data yet.</td></tr>'}</tbody>
     </table>
     ${hardest ? `<h3>Hardest questions</h3><ul class="hardest">${hardest}</ul>` : ''}`;
+
+  $('#results-body')
+    .querySelectorAll('[data-chat]')
+    .forEach((btn) => (btn.onclick = () => openChat(btn.dataset.chat, btn.dataset.name)));
 }
+
+// ---- Chat history modal ----
+async function openChat(participantId, name) {
+  $('#chat-title').textContent = `Chat history — ${name}`;
+  $('#chat-body').innerHTML = '<p class="meta">Loading…</p>';
+  $('#chat-modal').classList.remove('hidden');
+  try {
+    const data = await api(`/sessions/${currentSessionId}/runs/${participantId}/chat`);
+    if (!data.messages.length) {
+      $('#chat-body').innerHTML = `<p class="meta">${escapeHtml(data.error || 'No messages.')}</p>`;
+      return;
+    }
+    $('#chat-body').innerHTML = data.messages
+      .map((m) => {
+        const when = new Date(m.createdDateTime).toLocaleString();
+        if (m.kind === 'system') return `<div class="msg system">${escapeHtml(m.text)} <span class="when">${when}</span></div>`;
+        const who = m.kind === 'bot' ? 'Quiz bot' : name;
+        return `<div class="msg ${m.kind}"><div class="who">${escapeHtml(who)} <span class="when">${when}</span></div>${escapeHtml(m.text)}</div>`;
+      })
+      .join('');
+  } catch (err) {
+    $('#chat-body').innerHTML = `<p class="status err">${escapeHtml(err.message)}</p>`;
+  }
+}
+
+$('#chat-close').onclick = () => $('#chat-modal').classList.add('hidden');
+$('#chat-modal').onclick = (e) => {
+  if (e.target.id === 'chat-modal') $('#chat-modal').classList.add('hidden');
+};
 
 function escapeHtml(s) {
   return String(s || '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));

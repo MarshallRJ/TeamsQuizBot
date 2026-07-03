@@ -46,11 +46,17 @@ function makeFakeGraph() {
       sent.push({ chatId, html });
       return { id, createdDateTime };
     },
-    async getMessagesSince(chatId, since) {
-      return log(chatId)
-        .filter((m) => !m.bot && (!since || m.createdDateTime > since))
-        .map((m) => ({ id: m.id, createdDateTime: m.createdDateTime, fromUserId: 'u', text: m.text }))
-        .sort((a, b) => a.createdDateTime.localeCompare(b.createdDateTime));
+    // Single sweep across ALL chats, mirroring /users/{id}/chats/getAllMessages.
+    async getAllMessagesSince(since) {
+      const out = [];
+      for (const [chatId, msgs] of Object.entries(chats)) {
+        for (const m of msgs) {
+          if (m.bot) continue;
+          if (since && !(m.createdDateTime > since)) continue;
+          out.push({ chatId, id: m.id, createdDateTime: m.createdDateTime, fromUserId: 'u', text: m.text });
+        }
+      }
+      return out.sort((a, b) => a.createdDateTime.localeCompare(b.createdDateTime));
     },
   };
 }
@@ -82,10 +88,15 @@ async function setup() {
 }
 
 /** Build a session with several participants. */
-async function setupMulti(emails) {
+async function setupMulti(emails, opts = {}) {
   const store = createStore(new MemoryLevel());
   const graph = makeFakeGraph();
-  const engine = createEngine({ store, graphClient: graph, questionTimeoutMs: TIMEOUT });
+  const engine = createEngine({
+    store,
+    graphClient: graph,
+    questionTimeoutMs: TIMEOUT,
+    logger: opts.logger,
+  });
   const quiz = await store.createQuiz({
     title: 'Test',
     description: 'A short test quiz.',
@@ -314,7 +325,7 @@ describe('engine end-to-end (Graph mocked)', () => {
         throw new Error('Graph POST /chats failed: 404 user not found');
       },
       async sendMessage() {},
-      async getMessagesSince() {
+      async getAllMessagesSince() {
         return [];
       },
     };
@@ -385,6 +396,69 @@ describe('multi-participant ordering (regression)', () => {
     expect(run.currentIndex).toBe(1);
     expect(run.answers).toHaveLength(1);
     expect(graph.countSentTo('chat-a@example.com')).toBe(3); // welcome + Q1 + Q2 only
+  });
+
+  test('a tick during a slow startSession does not process or complete the session', async () => {
+    const store = createStore(new MemoryLevel());
+    let release;
+    const gate = new Promise((r) => (release = r));
+    const graph = {
+      async ensureOneOnOneChat(e) { return 'chat-' + e; },
+      async sendMessage() {
+        await gate; // block startSession mid-flight
+        return { id: 'm', createdDateTime: '2030-01-01T00:00:00.000Z' };
+      },
+      async getAllMessagesSince() { return []; },
+    };
+    const engine = createEngine({ store, graphClient: graph, questionTimeoutMs: TIMEOUT });
+    const quiz = await store.createQuiz({ title: 'T', description: 'd', questionsPerParticipant: 3 });
+    await store.setQuestions(quiz.id, QUESTIONS);
+    await store.setParticipants(quiz.id, [{ email: 'a@example.com', name: 'A' }]);
+
+    const startP = engine.startSession(quiz.id, T0); // do not await — it's blocked
+    // wait until the session record exists (so the starting-guard is registered)
+    let session;
+    for (let i = 0; i < 100 && !session; i++) {
+      await new Promise((r) => setImmediate(r));
+      session = (await store.listSessions(quiz.id))[0];
+    }
+    expect(session).toBeTruthy();
+
+    await engine.tick(T0 + 1000); // must skip the still-starting session
+
+    const after = (await store.getSession(session.id)).status;
+    expect(after).toBe('running'); // NOT prematurely completed
+    expect(await store.getSnapshot(session.id)).toBeNull(); // not finalized
+
+    release();
+    await startP;
+  });
+
+  test('a run whose question vanished mid-session is errored, not crashing the tick', async () => {
+    const silentLogger = { warn() {}, error() {}, log() {} };
+    const { store, graph, engine, quiz } = await setupMulti(['a@example.com', 'b@example.com'], {
+      logger: silentLogger,
+    });
+    const session = await engine.startSession(quiz.id, T0);
+
+    // Simulate a questions re-upload that orphans the running session's question ids.
+    await store.setQuestions(quiz.id, [
+      { text: 'new', options: { A: '1', B: '2', C: '3', D: '4' }, correct: 'A' },
+    ]);
+
+    // A answers — their run points at a now-missing question id.
+    const a = await runFor(store, session.id, 'a@example.com');
+    graph.enqueue(a.chatId, 'A');
+
+    await expect(engine.tick(T0 + 1000)).resolves.toBeUndefined(); // tick must not throw
+
+    const aRun = await runFor(store, session.id, 'a@example.com');
+    expect(aRun.status).toBe('error');
+    expect(aRun.error).toMatch(/not found|changed/i);
+
+    // B, who didn't answer, is untouched and still awaiting.
+    const bRun = await runFor(store, session.id, 'b@example.com');
+    expect(bRun.status).toBe('awaiting');
   });
 
   test('pre-existing chat history (from a previous session) is ignored', async () => {

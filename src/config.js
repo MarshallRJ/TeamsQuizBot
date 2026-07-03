@@ -26,6 +26,8 @@ const config = {
   engine: {
     pollIntervalMs: num(process.env.POLL_INTERVAL_MS, 5000),
     questionTimeoutMs: num(process.env.QUESTION_TIMEOUT_MS, 300000),
+    // Max concurrent Graph calls when sending questions / polling replies.
+    concurrency: num(process.env.ENGINE_CONCURRENCY, 5),
   },
 };
 

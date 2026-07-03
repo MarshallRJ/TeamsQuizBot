@@ -46,8 +46,32 @@ function escapeHtml(s) {
  * The engine is driven by tick(now); production wraps it in setInterval, tests
  * call it directly with scripted graphClient responses and a controlled clock.
  */
-function createEngine({ store, graphClient, questionTimeoutMs = 300000, logger = console }) {
+function createEngine({
+  store,
+  graphClient,
+  questionTimeoutMs = 300000,
+  concurrency = 5,
+  logger = console,
+}) {
   const nowIso = (now) => new Date(now).toISOString();
+
+  // Sessions currently being started. The poll loop must not process (or worse,
+  // mark complete) a session while startSession is still creating its runs.
+  const startingSessions = new Set();
+
+  /** Run fn over items with a bounded number of concurrent workers. */
+  async function mapLimit(items, limit, fn) {
+    const results = new Array(items.length);
+    let next = 0;
+    const worker = async () => {
+      while (next < items.length) {
+        const i = next++;
+        results[i] = await fn(items[i], i);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+    return results;
+  }
 
   /**
    * Open a 1:1 chat with the participant by their sign-in address. Graph resolves
@@ -59,15 +83,27 @@ function createEngine({ store, graphClient, questionTimeoutMs = 300000, logger =
     return graphClient.ensureOneOnOneChat(participant.email);
   }
 
+  /** Look up the run's current question, or fail loudly if it has gone missing. */
+  function questionFor(run, questionsById) {
+    const q = questionsById.get(run.questionOrder[run.currentIndex]);
+    if (!q) {
+      throw new Error(
+        `Question ${run.questionOrder[run.currentIndex]} not found — the quiz's ` +
+          `questions were likely changed while this session was running.`
+      );
+    }
+    return q;
+  }
+
   /** Send question at run.currentIndex; sets timing + status on the run. */
   async function sendCurrentQuestion(run, questionsById, now) {
     const total = run.questionOrder.length;
-    const q = questionsById.get(run.questionOrder[run.currentIndex]);
+    const q = questionFor(run, questionsById);
     const sent = await graphClient.sendMessage(run.chatId, formatQuestion(q, run.currentIndex, total));
     // Watermark replies against Graph's clock: only messages newer than this
     // just-sent question count as answers to it. This ignores any pre-existing
     // chat history (e.g. replies from a previous session in the same 1:1 chat).
-    if (sent && sent.createdDateTime) run.seenUpTo = sent.createdDateTime;
+    run.seenUpTo = sent && sent.createdDateTime ? sent.createdDateTime : nowIso(now);
     run.currentSentAt = nowIso(now); // local clock, used only for the timeout
     run.reprompted = false;
     run.status = 'awaiting';
@@ -75,7 +111,7 @@ function createEngine({ store, graphClient, questionTimeoutMs = 300000, logger =
 
   /** Record an answer for the current question and move to the next (or finish). */
   async function recordAndAdvance(run, questionsById, given, now) {
-    const q = questionsById.get(run.questionOrder[run.currentIndex]);
+    const q = questionFor(run, questionsById);
     run.answers.push({
       questionId: q.id,
       given,
@@ -117,35 +153,40 @@ function createEngine({ store, graphClient, questionTimeoutMs = 300000, logger =
     const questionsById = new Map(questions.map((q) => [q.id, q]));
 
     const session = await store.createSession(quizId);
+    startingSessions.add(session.id); // no await between createSession and here
 
-    for (const participant of participants) {
-      const questionOrder = pickN(quiz.questionIds, quiz.questionsPerParticipant);
-      let run = await store.createRun({
-        sessionId: session.id,
-        participantId: participant.id,
-        participantEmail: participant.email,
-        participantName: participant.name,
-        chatId: null,
-        questionOrder,
-        currentIndex: 0,
-        status: 'pending',
-        currentSentAt: null,
-        seenUpTo: null,
-        reprompted: false,
-        answers: [],
-        error: null,
+    try {
+      await mapLimit(participants, concurrency, async (participant) => {
+        const questionOrder = pickN(quiz.questionIds, quiz.questionsPerParticipant);
+        const run = await store.createRun({
+          sessionId: session.id,
+          participantId: participant.id,
+          participantEmail: participant.email,
+          participantName: participant.name,
+          chatId: null,
+          questionOrder,
+          currentIndex: 0,
+          status: 'pending',
+          currentSentAt: null,
+          seenUpTo: null,
+          reprompted: false,
+          answers: [],
+          error: null,
+        });
+
+        try {
+          run.chatId = await ensureChat(participant);
+          await graphClient.sendMessage(run.chatId, formatWelcome(quiz, run.questionOrder.length));
+          await sendCurrentQuestion(run, questionsById, now);
+        } catch (err) {
+          run.status = 'error';
+          run.error = err.message;
+          logger.error(`Failed to start run for ${participant.email}: ${err.message}`);
+        }
+        await store.updateRun(run);
       });
-
-      try {
-        run.chatId = await ensureChat(participant);
-        await graphClient.sendMessage(run.chatId, formatWelcome(quiz, run.questionOrder.length));
-        await sendCurrentQuestion(run, questionsById, now);
-      } catch (err) {
-        run.status = 'error';
-        run.error = err.message;
-        logger.error(`Failed to start run for ${participant.email}: ${err.message}`);
-      }
-      await store.updateRun(run);
+    } finally {
+      startingSessions.delete(session.id);
     }
 
     return session;
@@ -182,76 +223,106 @@ function createEngine({ store, graphClient, questionTimeoutMs = 300000, logger =
     return session;
   }
 
-  /** Process a single run: read replies, score/advance/re-prompt/time-out. */
-  async function tickRun(run, questionsById, now) {
+  /**
+   * Process one run against the replies already fetched for its chat this tick.
+   * Handles score/advance, the single re-prompt, and timeout skip.
+   */
+  async function processRun(run, questionsById, now, chatMessages) {
     if (run.status !== 'awaiting') return;
 
-    const messages = await graphClient.getMessagesSince(run.chatId, run.seenUpTo);
-    // Advance the watermark past everything we just read so no message is ever
-    // considered twice — even if we don't act on it this tick.
-    if (messages.length) {
-      run.seenUpTo = messages.reduce(
+    // Only messages newer than this run's current-question watermark count.
+    const relevant = (chatMessages || [])
+      .filter((m) => !run.seenUpTo || m.createdDateTime > run.seenUpTo)
+      .sort((a, b) => a.createdDateTime.localeCompare(b.createdDateTime));
+    if (relevant.length) {
+      run.seenUpTo = relevant.reduce(
         (max, m) => (m.createdDateTime > max ? m.createdDateTime : max),
         run.seenUpTo || ''
       );
     }
 
-    const validMsg = messages
-      .map((m) => normalizeAnswer(m.text))
-      .find((letter) => letter !== null);
-
+    const validMsg = relevant.map((m) => normalizeAnswer(m.text)).find((letter) => letter !== null);
     if (validMsg) {
       await recordAndAdvance(run, questionsById, validMsg, now);
       return;
     }
 
-    const hasReply = messages.length > 0;
+    const hasReply = relevant.length > 0;
     const timedOut = now - Date.parse(run.currentSentAt) >= questionTimeoutMs;
 
     if (!run.reprompted && (hasReply || timedOut)) {
-      // First strike: nudge them once and restart the wait window.
       await graphClient.sendMessage(run.chatId, REPROMPT_HTML);
       run.reprompted = true;
       run.currentSentAt = nowIso(now);
     } else if (run.reprompted && (hasReply || timedOut)) {
-      // Second strike: give up on this question, mark unanswered, move on.
       await recordAndAdvance(run, questionsById, null, now);
     }
     // otherwise: still waiting, do nothing this tick
   }
 
-  /** Advance every running session by one poll cycle. */
+  /**
+   * One poll cycle for ALL running sessions. Makes a SINGLE Graph call to fetch
+   * new messages across every chat (not one call per participant), then routes
+   * each reply to its run by chatId. The fetch watermark is the oldest
+   * outstanding question across all runs — a server timestamp, so no clock skew.
+   */
   async function tick(now = Date.now()) {
-    const sessions = await store.listSessions();
+    const sessions = (await store.listSessions()).filter(
+      (s) => s.status === 'running' && !startingSessions.has(s.id)
+    );
+    if (!sessions.length) return;
+
+    const loaded = [];
+    let since = null;
     for (const session of sessions) {
-      if (session.status !== 'running') continue;
-      await tickSession(session, now);
-    }
-  }
-
-  async function tickSession(session, now = Date.now()) {
-    const quiz = await store.getQuiz(session.quizId);
-    const questions = await store.listQuestions(session.quizId);
-    const questionsById = new Map(questions.map((q) => [q.id, q]));
-
-    const runs = await store.listRuns(session.id);
-    for (const run of runs) {
-      if (run.status === 'awaiting') {
-        await tickRun(run, questionsById, now);
-        await store.updateRun(run);
+      const questions = await store.listQuestions(session.quizId);
+      const questionsById = new Map(questions.map((q) => [q.id, q]));
+      const runs = await store.listRuns(session.id);
+      loaded.push({ session, questionsById, runs });
+      for (const r of runs) {
+        if (r.status === 'awaiting' && r.seenUpTo && (since === null || r.seenUpTo < since)) {
+          since = r.seenUpTo;
+        }
       }
     }
 
-    const active = runs.some((r) => r.status === 'awaiting' || r.status === 'pending');
-    if (!active) {
-      session.status = 'completed';
-      session.completedAt = nowIso(now);
-      await finalizeSession(session, now);
+    // Single sweep across all chats, grouped by chatId for routing.
+    const messagesByChat = {};
+    if (since !== null) {
+      for (const m of await graphClient.getAllMessagesSince(since)) {
+        (messagesByChat[m.chatId] = messagesByChat[m.chatId] || []).push(m);
+      }
     }
-    return { quiz, runs };
+
+    for (const { session, questionsById, runs } of loaded) {
+      try {
+        const awaiting = runs.filter((r) => r.status === 'awaiting');
+        await mapLimit(awaiting, concurrency, async (run) => {
+          // Isolate each run: a failure (e.g. a missing question) marks just that
+          // run as errored instead of aborting the tick for everyone else.
+          try {
+            await processRun(run, questionsById, now, messagesByChat[run.chatId]);
+          } catch (err) {
+            run.status = 'error';
+            run.error = err.message;
+            logger.error(`Run for ${run.participantEmail} failed: ${err.message}`);
+          }
+          await store.updateRun(run);
+        });
+
+        const active = runs.some((r) => r.status === 'awaiting' || r.status === 'pending');
+        if (!active) {
+          session.status = 'completed';
+          session.completedAt = nowIso(now);
+          await finalizeSession(session, now);
+        }
+      } catch (err) {
+        logger.error(`Session ${session.id} tick failed: ${err.message}`);
+      }
+    }
   }
 
-  return { startSession, abandonSession, tick, tickSession, tickRun, scoreRun, formatQuestion };
+  return { startSession, abandonSession, tick, processRun, scoreRun, formatQuestion };
 }
 
 module.exports = { createEngine, formatQuestion, formatWelcome, escapeHtml };

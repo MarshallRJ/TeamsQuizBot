@@ -12,11 +12,17 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 *
 /** Wrap an async route so rejected promises hit the error handler. */
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
+/** True if the quiz has a session currently running. */
+async function hasRunningSession(store, quizId) {
+  const sessions = await store.listSessions(quizId);
+  return sessions.some((s) => s.status === 'running');
+}
+
 /**
  * Build the /api router. `store` and `engine` are injected so the whole HTTP
  * layer can be exercised without a real Graph connection.
  */
-function createApiRouter({ store, engine }) {
+function createApiRouter({ store, engine, graphClient }) {
   const router = express.Router();
 
   // ---- Quizzes ----
@@ -59,6 +65,11 @@ function createApiRouter({ store, engine }) {
     upload.single('file'),
     wrap(async (req, res) => {
       if (!req.file) return res.status(400).json({ error: 'No file uploaded (field "file").' });
+      if (await hasRunningSession(store, req.params.id)) {
+        return res.status(409).json({
+          error: 'Cannot change questions while a session is running. Abandon it first.',
+        });
+      }
       const questions = parseQuestions(req.file.buffer);
       const count = await store.setQuestions(req.params.id, questions);
       res.json({ count });
@@ -78,6 +89,11 @@ function createApiRouter({ store, engine }) {
     upload.single('file'),
     wrap(async (req, res) => {
       if (!req.file) return res.status(400).json({ error: 'No file uploaded (field "file").' });
+      if (await hasRunningSession(store, req.params.id)) {
+        return res.status(409).json({
+          error: 'Cannot change participants while a session is running. Abandon it first.',
+        });
+      }
       const parsed = parseParticipants(req.file.buffer);
       const created = await store.setParticipants(req.params.id, parsed);
       res.json({ count: created.length, participants: created });
@@ -123,6 +139,24 @@ function createApiRouter({ store, engine }) {
         error: r.error || null,
       }));
       res.json({ session, progress });
+    })
+  );
+
+  // Full Teams chat history for one participant in a session (auditing).
+  router.get(
+    '/sessions/:id/runs/:participantId/chat',
+    wrap(async (req, res) => {
+      if (!graphClient) return res.status(503).json({ error: 'Graph client not configured.' });
+      const runs = await store.listRuns(req.params.id);
+      const run = runs.find((r) => r.participantId === req.params.participantId);
+      if (!run) return res.status(404).json({ error: 'Participant not found in this session.' });
+
+      const participant = { name: run.participantName || '', email: run.participantEmail || '' };
+      if (!run.chatId) {
+        return res.json({ participant, error: run.error || 'No chat was opened.', messages: [] });
+      }
+      const messages = await graphClient.getChatMessages(run.chatId);
+      res.json({ participant, messages });
     })
   );
 

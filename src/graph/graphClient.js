@@ -25,10 +25,17 @@ function htmlToText(html) {
  * @param {Function} [opts.fetchImpl]     defaults to global fetch
  * @param {string}   [opts.baseUrl]
  */
-function createGraphClient({ tokenProvider, fetchImpl = fetch, baseUrl = DEFAULT_BASE }) {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function createGraphClient({
+  tokenProvider,
+  fetchImpl = fetch,
+  baseUrl = DEFAULT_BASE,
+  maxRetries = 4,
+}) {
   let selfId = null;
 
-  async function request(method, path, body) {
+  async function request(method, path, body, attempt = 0) {
     const token = await tokenProvider.getToken();
     const res = await fetchImpl(`${baseUrl}${path}`, {
       method,
@@ -38,6 +45,16 @@ function createGraphClient({ tokenProvider, fetchImpl = fetch, baseUrl = DEFAULT
       },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
+
+    // Graph throttles bursts (429) and has transient 5xx. Back off and retry,
+    // honouring Retry-After when present. This is essential at 70+ participants.
+    if ((res.status === 429 || res.status >= 500) && attempt < maxRetries) {
+      const header = res.headers && res.headers.get ? res.headers.get('retry-after') : null;
+      const waitS = Number(header) || Math.min(2 ** attempt, 30);
+      await sleep(waitS * 1000);
+      return request(method, path, body, attempt + 1);
+    }
+
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
       throw new Error(`Graph ${method} ${path} failed: ${res.status} ${detail}`);
@@ -94,23 +111,74 @@ function createGraphClient({ tokenProvider, fetchImpl = fetch, baseUrl = DEFAULT
     },
 
     /**
-     * Return messages in a chat created strictly after `sinceIso`, excluding
-     * messages sent by the signed-in user (the bot). Oldest first.
+     * Fetch the latest reply across ALL of the signed-in user's chats in a single
+     * (paginated) sweep, rather than polling each chat separately. Uses
+     * `/me/chats?$expand=lastMessagePreview` — delegated Chat.Read, unlike
+     * getAllMessages which is app-only/protected and 412s in a delegated context.
+     *
+     * Returns one message per chat (its last), each tagged with `chatId` for
+     * routing, keeping only genuine human replies newer than `sinceIso`. Excludes
+     * the bot's own messages and system/event messages ("members added", etc.),
+     * which are not `messageType: 'message'` and must never look like an answer.
      */
-    async getMessagesSince(chatId, sinceIso) {
+    async getAllMessagesSince(sinceIso) {
       const meId = await getSelfId();
-      const data = await request('GET', `/chats/${chatId}/messages?$top=50`);
-      const messages = (data.value || [])
-        .filter((m) => m.createdDateTime && (!sinceIso || m.createdDateTime > sinceIso))
-        .filter((m) => !(m.from && m.from.user && m.from.user.id === meId))
-        .map((m) => ({
-          id: m.id,
-          createdDateTime: m.createdDateTime,
-          fromUserId: m.from && m.from.user ? m.from.user.id : null,
-          text: htmlToText(m.body && m.body.content),
-        }))
+      let path = '/me/chats?$expand=lastMessagePreview&$top=50';
+
+      const out = [];
+      let guard = 0;
+      while (path && guard++ < 200) {
+        const data = await request('GET', path);
+        for (const chat of data.value || []) {
+          const m = chat.lastMessagePreview;
+          if (!m) continue;
+          if (m.messageType && m.messageType !== 'message') continue;
+          if (!(m.from && m.from.user && m.from.user.id) || m.from.user.id === meId) continue;
+          if (sinceIso && !(m.createdDateTime > sinceIso)) continue;
+          const text = htmlToText(m.body && m.body.content);
+          if (!text) continue;
+          out.push({
+            chatId: chat.id,
+            id: m.id,
+            createdDateTime: m.createdDateTime,
+            fromUserId: m.from.user.id,
+            text,
+          });
+        }
+        const next = data['@odata.nextLink'];
+        path = next ? next.replace(baseUrl, '') : null;
+      }
+      return out.sort((a, b) => a.createdDateTime.localeCompare(b.createdDateTime));
+    },
+
+    /**
+     * Fetch a chat's full message history (both sides), oldest first, for
+     * auditing. Each message is labelled `kind`: 'bot' (sent by the signed-in
+     * quiz account), 'participant', or 'system' (membership/created events).
+     */
+    async getChatMessages(chatId) {
+      const meId = await getSelfId();
+      let path = `/chats/${chatId}/messages?$top=50`;
+      const out = [];
+      let guard = 0;
+      while (path && guard++ < 200) {
+        const data = await request('GET', path);
+        for (const m of data.value || []) {
+          const isSystem = m.messageType && m.messageType !== 'message';
+          const fromId = m.from && m.from.user ? m.from.user.id : null;
+          out.push({
+            id: m.id,
+            createdDateTime: m.createdDateTime,
+            kind: isSystem ? 'system' : fromId === meId ? 'bot' : 'participant',
+            text: htmlToText(m.body && m.body.content),
+          });
+        }
+        const next = data['@odata.nextLink'];
+        path = next ? next.replace(baseUrl, '') : null;
+      }
+      return out
+        .filter((m) => m.text || m.kind === 'system')
         .sort((a, b) => a.createdDateTime.localeCompare(b.createdDateTime));
-      return messages;
     },
   };
 }

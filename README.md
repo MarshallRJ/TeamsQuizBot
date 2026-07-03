@@ -48,7 +48,9 @@ npm start                 # opens the admin UI on http://127.0.0.1:3000
 3. **Upload participants** (CSV) — a column `email` (optional `name`), or a plain list of
    emails. See `samples/participants.csv`.
 4. **Start quiz session** — everyone is sent their first question in Teams.
-5. **Watch results** — live per-participant progress and scores; export a CSV.
+5. **Watch results** — live per-participant progress and scores; export a CSV. Each
+   participant row has a **Chat** button that opens their full Teams conversation
+   (questions + replies, pulled live from Graph) for auditing.
 
 ## Configuration (`.env`)
 
@@ -97,6 +99,24 @@ src/
 The engine is driven by `tick(now)`: production wraps it in `setInterval`; tests call it
 directly with a controlled clock and a scripted fake Graph client, which is what keeps
 the whole flow testable without Teams.
+
+### Reply polling (one call for all chats)
+
+Each `tick` makes a **single** Graph call — `GET /me/chats?$expand=lastMessagePreview` —
+to fetch the latest message in *every* chat at once, then routes each reply to its run by
+`chatId`. This is O(pages) Graph calls per poll instead of one-per-participant, which is
+what made 70-person quizzes slow. Replies older than a per-run watermark (the current
+question's server-side `createdDateTime`) are ignored, so there is no local/server clock
+skew and no re-reading of old history — the equivalent of "marking read" without extra calls.
+
+> **Why not `getAllMessages`?** That export API returns *every* message (not just the last
+> per chat) but is app-only/protected — it returns `412 "not supported in delegated context"`
+> under the username/password (ROPC) flow this app uses, so we use `lastMessagePreview`.
+>
+> **Limitation of `lastMessagePreview`:** only a chat's *most recent* message is visible per
+> poll. In practice participants reply with a single letter, so this is fine; but if someone
+> answers and then immediately sends more chatter before the next poll, only the latest
+> message is seen (which may trigger the one re-prompt rather than scoring the answer).
 
 ## Notes / limitations
 

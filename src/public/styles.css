@@ -44,7 +44,7 @@ main {
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
 }
 .card h2 { margin-top: 0; }
-.hidden { display: none; }
+.hidden { display: none !important; }
 
 .row { display: flex; gap: 0.75rem; align-items: end; flex-wrap: wrap; }
 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
@@ -114,4 +114,23 @@ th { color: var(--muted); font-weight: 600; }
 .summary .stat.err { color: var(--err); }
 ul.hardest { font-size: 0.88rem; color: var(--ink); padding-left: 1.1rem; }
 ul.hardest li { margin: 0.25rem 0; }
+
+/* Chat history modal */
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.45);
+  display: flex; align-items: center; justify-content: center; padding: 1rem; z-index: 50;
+}
+.modal {
+  background: var(--card); border-radius: 10px; width: 100%; max-width: 560px;
+  max-height: 80vh; display: flex; flex-direction: column; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+}
+.modal-head { display: flex; justify-content: space-between; align-items: center; padding: 1rem 1.25rem; border-bottom: 1px solid var(--border); }
+.modal-head h3 { margin: 0; font-size: 1rem; }
+.chat-body { padding: 1rem 1.25rem; overflow-y: auto; display: flex; flex-direction: column; gap: 0.6rem; }
+.msg { max-width: 80%; padding: 0.5rem 0.7rem; border-radius: 10px; font-size: 0.9rem; }
+.msg .who { font-size: 0.72rem; color: var(--muted); margin-bottom: 0.15rem; }
+.msg .when { opacity: 0.7; }
+.msg.bot { align-self: flex-start; background: #eef2ff; }
+.msg.participant { align-self: flex-end; background: #dcfce7; }
+.msg.system { align-self: center; background: transparent; color: var(--muted); font-size: 0.78rem; }
 a { color: var(--accent); }

@@ -22,9 +22,10 @@ function main() {
     store,
     graphClient,
     questionTimeoutMs: config.engine.questionTimeoutMs,
+    concurrency: config.engine.concurrency,
   });
 
-  const app = createApp({ store, engine });
+  const app = createApp({ store, engine, graphClient });
 
   const server = app.listen(config.web.port, config.web.host, () => {
     console.log(`TeamsQuizBot admin UI: http://${config.web.host}:${config.web.port}`);
